@@ -1,0 +1,109 @@
+// firestore.rules
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper Functions ───────────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isSuperAdmin() {
+      return isAdmin() &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'superadmin';
+    }
+
+    // ── Admins Collection ──────────────────────────────────────────────────
+
+    match /admins/{adminId} {
+      allow read:   if isAdmin();
+      allow create: if isSuperAdmin();
+      allow update: if isAdmin() && request.auth.uid == adminId;
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Content Collections (Admin write, anyone authenticated read) ────────
+
+    match /courses/{courseId} {
+      allow read:  if true;               // Public courses are readable
+      allow write: if isAdmin();
+    }
+
+    match /liveClasses/{classId} {
+      allow read:  if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /recordedClasses/{videoId} {
+      allow read:  if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /studyMaterials/{materialId} {
+      allow read: if isAuthenticated() &&
+        (!resource.data.premium || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /syllabus/{syllabusId} {
+      allow read:  if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /impQuestions/{questionId} {
+      allow read:  if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /prevYearPapers/{paperId} {
+      allow read:  if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // ── User Data (Users own their docs, admins see all) ───────────────────
+
+    match /users/{userId} {
+      allow read:   if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // ── Purchases (read-only for users, admin full access) ─────────────────
+
+    match /purchases/{purchaseId} {
+      allow read:   if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated();   // Created by payment webhook
+      allow update: if isAdmin();
+      allow delete: if isSuperAdmin();
+    }
+
+    // ── Notifications (admin only) ─────────────────────────────────────────
+
+    match /notifications/{notifId} {
+      allow read:   if isAuthenticated();
+      allow write:  if isAdmin();
+    }
+
+    // ── Feedback ───────────────────────────────────────────────────────────
+
+    match /feedback/{feedbackId} {
+      allow read:   if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ── Default deny ───────────────────────────────────────────────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

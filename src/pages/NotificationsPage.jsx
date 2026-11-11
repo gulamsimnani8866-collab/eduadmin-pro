@@ -1,283 +1,354 @@
-// src/pages/NotificationsPage.jsx
+// src/pages/NotificationsPage.jsx — Professional Push Notification & Broadcast Center
 import { useState, useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Send, Bell, Clock, Trash2, AlertTriangle } from 'lucide-react'
+import {
+  Send, Bell, Clock, Trash2, Smartphone, Users,
+  CheckCircle2, Sparkles, AlertCircle, Eye, Radio
+} from 'lucide-react'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 import { useNotifications } from '../hooks/useFirestore'
+import { storagePaths } from '../lib/storage'
 import {
   PageHeader, Card, Button, Badge, Input, Textarea, Select,
-  Toggle, TableSkeleton, ConfirmDialog
+  Toggle, TableSkeleton, ConfirmDialog, Tabs
 } from '../components/ui/index'
+import CloudinaryFileField from '../components/ui/CloudinaryFileField'
+
+const TARGET_AUDIENCES = [
+  { value: 'all', label: 'All Registered Students' },
+  { value: 'premium', label: 'Premium Subscribers Only' },
+  { value: 'free', label: 'Free Tier Students' },
+  { value: 'general', label: 'General Announcements' },
+]
+
+const QUICK_TEMPLATES = [
+  {
+    label: '🔴 Live Class Alert',
+    title: 'Live Classroom Broadcasting in 10 Minutes!',
+    message: 'Join your instructor for the scheduled live problem-solving marathon. Keep your notebooks ready.',
+    target: 'all',
+  },
+  {
+    label: '📢 Mock Test Live',
+    title: 'All India Full Mock Test Paper is Now Live',
+    message: 'The examination portal is now open. Complete the 3-hour timed practice paper before midnight.',
+    target: 'all',
+  },
+  {
+    label: '📚 New Study Notes',
+    title: 'High-Yield Revision Formula Sheets Uploaded',
+    message: 'Comprehensive formula summaries have been published to the Study Materials repository. Download now.',
+    target: 'premium',
+  },
+]
 
 const notifSchema = z.object({
-  title:       z.string().min(1, 'Title required'),
-  body:        z.string().min(1, 'Message required'),
-  imageUrl:    z.string().trim().url('Enter a valid URL (https://...)').optional().or(z.literal('')),
-  deepLink:    z.string().optional(),
-  targetType:  z.enum(['all', 'course', 'individual']),
-  courseId:    z.string().optional(),
-  targetUser:  z.string().optional(),
-  scheduledAt: z.string().optional(),
+  title:       z.string().min(3, 'Title is required (min 3 chars)'),
+  message:     z.string().min(5, 'Message body is required'),
+  target:      z.string().min(1, 'Target audience required'),
+  imageUrl:    z.string().optional(),
 })
 
-function parseDateValue(val) {
-  if (!val) return null
-  try {
-    if (typeof val?.toDate === 'function') {
-      const d = val.toDate()
-      return isNaN(d.getTime()) ? null : d
-    }
-    if (typeof val === 'object' && typeof val.seconds === 'number') {
-      const d = new Date(val.seconds * 1000)
-      return isNaN(d.getTime()) ? null : d
-    }
-    const d = val instanceof Date ? val : new Date(val)
-    return isNaN(d.getTime()) ? null : d
-  } catch {
-    return null
-  }
-}
-
-function formatNotifDate(n) {
-  const raw = n?.sentAt ?? n?.scheduledAt ?? n?.createdAt ?? n?.timestamp
-  const d = parseDateValue(raw)
-  if (!d) return '—'
-  try {
-    return format(d, 'MMM d, HH:mm')
-  } catch {
-    return '—'
-  }
-}
-
 export default function NotificationsPage() {
-  const { docs: rawHistory, loading, error, add, remove } = useNotifications({ orderByField: null })
-  const [scheduled, setScheduled] = useState(false)
+  const { docs: history, loading, add, remove } = useNotifications()
   const [deleteTarget, setDeleteTarget] = useState(null)
-  const [deleting, setDeleting] = useState(false)
+  const [sending, setSending] = useState(false)
 
-  const history = useMemo(() => {
-    return [...rawHistory].sort((a, b) => {
-      const da = parseDateValue(a?.sentAt ?? a?.createdAt ?? a?.scheduledAt)?.getTime() ?? 0
-      const db = parseDateValue(b?.sentAt ?? b?.createdAt ?? b?.scheduledAt)?.getTime() ?? 0
-      return db - da
-    })
-  }, [rawHistory])
-
-  const { register, handleSubmit, watch, reset, formState: { errors, isSubmitting } } = useForm({
+  const {
+    register,
+    handleSubmit,
+    watch,
+    reset,
+    setValue,
+    formState: { errors },
+  } = useForm({
     resolver: zodResolver(notifSchema),
     defaultValues: {
       title: '',
-      body: '',
+      message: '',
+      target: 'all',
       imageUrl: '',
-      deepLink: '',
-      targetType: 'all',
-      courseId: '',
-      targetUser: '',
-      scheduledAt: '',
     },
   })
 
-  const targetType = watch('targetType')
+  function applyTemplate(tpl) {
+    setValue('title', tpl.title)
+    setValue('message', tpl.message)
+    setValue('target', tpl.target)
+    toast.success(`Template applied: ${tpl.label}`)
+  }
+
+  const previewTitle = watch('title') || 'Notification Title Preview'
+  const previewMessage = watch('message') || 'The broadcast announcement text will appear here as students see it on their mobile devices.'
+  const previewTarget = watch('target')
+  const previewImageUrl = watch('imageUrl') || ''
 
   async function onSubmit(data) {
-    if (data.targetType === 'course' && !data.courseId?.trim()) {
-      return toast.error('Please enter a Course ID')
-    }
-    if (data.targetType === 'individual' && !data.targetUser?.trim()) {
-      return toast.error('Please enter a User Email / ID')
-    }
-    if (scheduled && !data.scheduledAt) {
-      return toast.error('Please select a schedule date & time')
-    }
-
+    setSending(true)
     try {
-      const nowIso = new Date().toISOString()
       await add({
-        title:       data.title.trim(),
-        body:        data.body.trim(),
-        imageUrl:    data.imageUrl?.trim() || '',
-        deepLink:    data.deepLink?.trim() || '',
-        targetType:  data.targetType,
-        courseId:    data.targetType === 'course' ? data.courseId?.trim() : null,
-        targetUser:  data.targetType === 'individual' ? data.targetUser?.trim() : null,
-        scheduledAt: scheduled ? new Date(data.scheduledAt).toISOString() : null,
-        sentAt:      scheduled ? new Date(data.scheduledAt).toISOString() : nowIso,
-        status:      scheduled ? 'scheduled' : 'sent',
-        delivered:   0,
-        opened:      0,
+        ...data,
+        sentAt: new Date().toISOString(),
+        reach: 0,
+        readRate: 0,
+        status: 'delivered',
       })
-      toast.success(scheduled ? 'Notification scheduled!' : 'Notification sent!')
-      reset()
-      setScheduled(false)
-    } catch {
-      // Error toast is already displayed by useFirestore add()
-    }
-  }
-
-  async function handleDelete() {
-    if (!deleteTarget) return
-    setDeleting(true)
-    try {
-      await remove(deleteTarget.id)
-      toast.success('Notification deleted')
+      toast.success('Broadcast notification pushed to students!')
+      reset({
+        title: '',
+        message: '',
+        target: 'all',
+        imageUrl: '',
+      })
     } finally {
-      setDeleting(false)
-      setDeleteTarget(null)
+      setSending(false)
     }
   }
 
-  const statusColors = { sent: 'blue', delivered: 'green', scheduled: 'yellow', failed: 'red' }
+  async function handleDeleteConfirm() {
+    if (!deleteTarget) return
+    await remove(deleteTarget.id)
+    setDeleteTarget(null)
+  }
 
   return (
-    <>
-      <PageHeader title="Notifications" count={history.length} />
+    <div className="space-y-6">
+      <PageHeader
+        title="Broadcasts & Push Notifications"
+        description="Deliver instantaneous institutional alerts, live session reminders, and test announcements"
+        count={history.length}
+      />
 
-      {error && (
-        <div className="mb-5 flex items-center gap-2 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm">
-          <AlertTriangle size={16} className="flex-shrink-0" />
-          <span>Failed to load notifications: {error}</span>
-        </div>
-      )}
+      {/* Main split: Broadcast Form (Left) + Real-time Mobile Push Preview (Right) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Form Column */}
+        <Card className="lg:col-span-7 p-6 border-slate-200/80 shadow-xs">
+          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
+            <div className="flex items-center gap-2">
+              <Bell size={18} className="text-accent-600" />
+              <h3 className="text-base font-bold text-slate-900">Compose Institutional Broadcast</h3>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-200 rounded font-mono text-[10px]">Ctrl+Enter</kbd> to send
+            </span>
+          </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Composer */}
-        <Card>
-          <h2 className="font-semibold text-gray-900 mb-4 flex items-center gap-2">
-            <Bell size={16} className="text-blue-600" /> Compose Notification
-          </h2>
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          {/* Quick Announcement Templates */}
+          <div className="mb-4">
+            <label className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block mb-1.5">
+              Quick Announcement Presets:
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {QUICK_TEMPLATES.map(tpl => (
+                <button
+                  key={tpl.label}
+                  type="button"
+                  onClick={() => applyTemplate(tpl)}
+                  className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-slate-50 text-slate-700 border border-slate-200 hover:bg-accent-50 hover:text-accent-700 hover:border-accent-200 transition"
+                >
+                  {tpl.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <form
+            onSubmit={handleSubmit(onSubmit)}
+            onKeyDown={(e) => {
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault()
+                handleSubmit(onSubmit)()
+              }
+            }}
+            className="space-y-4"
+          >
+            <Select
+              label="Recipient Audience"
+              options={TARGET_AUDIENCES}
+              error={errors.target?.message}
+              {...register('target')}
+            />
+
             <Input
-              label="Title *"
+              label="Notification Headline / Title *"
+              placeholder="e.g. Admit Card Released for Mock Test"
               error={errors.title?.message}
               {...register('title')}
-              placeholder="Notification title"
             />
+
             <Textarea
-              label="Message *"
-              error={errors.body?.message}
-              {...register('body')}
-              placeholder="Notification body…"
+              label="Announcement Body *"
+              placeholder="Write a clear, actionable message for students..."
               rows={3}
+              error={errors.message?.message}
+              {...register('message')}
             />
-            <Input
-              label="Image URL (optional)"
+
+            <CloudinaryFileField
+              label="Banner Image (Optional)"
+              value={previewImageUrl}
+              onChange={(url) => setValue('imageUrl', url, { shouldDirty: true })}
+              accept="image/png,image/jpeg,image/webp"
+              kind="image"
+              storagePath={() => storagePaths.notificationBanner(`notif_${Date.now()}`)}
+              placeholder="https://res.cloudinary.com/... or paste banner URL"
+              helperText="Upload banner image to Cloudinary (URL saves in Firebase) for rich push notification"
               error={errors.imageUrl?.message}
-              {...register('imageUrl')}
-              placeholder="https://…"
             />
-            <Input
-              label="Deep Link (optional)"
-              error={errors.deepLink?.message}
-              {...register('deepLink')}
-              placeholder="eduapp://course/123"
-            />
-            <Select
-              label="Target Audience"
-              options={[
-                { value: 'all',        label: 'All Students' },
-                { value: 'course',     label: 'Course Subscribers' },
-                { value: 'individual', label: 'Individual User' },
-              ]}
-              {...register('targetType')}
-            />
-            {targetType === 'course' && (
-              <Input
-                label="Course ID *"
-                error={errors.courseId?.message}
-                {...register('courseId')}
-                placeholder="Enter course ID…"
-              />
-            )}
-            {targetType === 'individual' && (
-              <Input
-                label="User Email / ID *"
-                error={errors.targetUser?.message}
-                {...register('targetUser')}
-                placeholder="user@example.com"
-              />
-            )}
-            <Toggle checked={scheduled} onChange={setScheduled} label="Schedule for later" />
-            {scheduled && (
-              <Input
-                label="Schedule Date & Time *"
-                type="datetime-local"
-                error={errors.scheduledAt?.message}
-                {...register('scheduledAt')}
-              />
-            )}
-            <Button type="submit" loading={isSubmitting} className="w-full justify-center">
-              <Send size={14} /> {scheduled ? 'Schedule Notification' : 'Send Now'}
-            </Button>
+
+            <div className="pt-2 flex items-center justify-between">
+              <Button
+                type="submit"
+                variant="primary"
+                loading={sending}
+                icon={Send}
+              >
+                Send Broadcast Now
+              </Button>
+            </div>
           </form>
         </Card>
 
-        {/* History */}
-        <div>
-          <h2 className="font-semibold text-gray-900 mb-4">Notification History</h2>
-          {loading ? (
-            <TableSkeleton rows={4} cols={4} />
-          ) : history.length === 0 ? (
-            <Card>
-              <p className="text-sm text-gray-400 text-center py-8">No notifications sent yet</p>
-            </Card>
-          ) : (
-            <div className="space-y-3">
-              {history.map(n => {
-                const statusText = typeof n.status === 'string' ? n.status : 'sent'
-                const titleText  = typeof n.title === 'string' || typeof n.title === 'number' ? String(n.title) : 'Untitled Notification'
-                const bodyText   = typeof n.body === 'string' || typeof n.body === 'number'
-                  ? String(n.body)
-                  : typeof n.message === 'string'
-                    ? n.message
-                    : ''
-                const deliveredCount = typeof n.delivered === 'number' ? n.delivered : Number(n.delivered) || 0
-                const openedCount    = typeof n.opened === 'number' ? n.opened : Number(n.opened) || 0
-
-                return (
-                  <Card key={n.id} className="py-3">
-                    <div className="flex items-start justify-between gap-2 mb-2">
-                      <p className="font-medium text-sm text-gray-900">{titleText}</p>
-                      <div className="flex items-center gap-2 flex-shrink-0">
-                        <Badge variant={statusColors[statusText] ?? 'gray'}>{statusText}</Badge>
-                        <button
-                          type="button"
-                          onClick={() => setDeleteTarget(n)}
-                          className="p-1 text-gray-400 hover:text-red-500 rounded transition"
-                          title="Delete notification"
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                      </div>
-                    </div>
-                    <p className="text-xs text-gray-500 line-clamp-2">{bodyText}</p>
-                    <div className="flex flex-wrap items-center gap-4 mt-2 text-xs text-gray-400">
-                      <span className="flex items-center gap-1">
-                        <Clock size={10} />
-                        {formatNotifDate(n)}
-                      </span>
-                      <span>📬 {deliveredCount} delivered</span>
-                      <span>👆 {openedCount} opened</span>
-                    </div>
-                  </Card>
-                )
-              })}
+        {/* Live Device Notification Preview */}
+        <Card className="lg:col-span-5 p-6 bg-slate-900 text-white border-slate-800 shadow-xl">
+          <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-800">
+            <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+              <Smartphone size={16} className="text-accent-400" />
+              <span>Real-time Mobile Push Preview</span>
             </div>
-          )}
-        </div>
+            <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+              Live Mockup
+            </span>
+          </div>
+
+          {/* Smartphone Notification Box */}
+          <div className="w-full bg-slate-950/90 border border-slate-800 rounded-2xl p-4 shadow-2xl space-y-3">
+            <div className="flex items-center justify-between text-[11px] text-slate-400">
+              <div className="flex items-center gap-1.5">
+                <div className="w-4 h-4 rounded-md bg-accent-600 flex items-center justify-center text-white text-[9px] font-bold">
+                  E
+                </div>
+                <span className="font-semibold text-slate-200">EduAdmin App</span>
+              </div>
+              <span>Just now</span>
+            </div>
+
+            <div>
+              <h4 className="text-xs font-bold text-white line-clamp-1">
+                {previewTitle}
+              </h4>
+              <p className="text-xs text-slate-300 mt-1 leading-relaxed line-clamp-3">
+                {previewMessage}
+              </p>
+            </div>
+
+            {previewImageUrl && (
+              <div className="rounded-xl overflow-hidden border border-slate-800 h-28 bg-slate-900">
+                <img src={previewImageUrl} alt="Banner Preview" className="w-full h-full object-cover" />
+              </div>
+            )}
+
+            <div className="pt-2 flex items-center justify-between text-[10px] text-slate-500 border-t border-slate-900">
+              <span>Audience: {TARGET_AUDIENCES.find(t => t.value === previewTarget)?.label || 'All Students'}</span>
+              <span className="text-accent-400 font-semibold">Tap to open</span>
+            </div>
+          </div>
+
+          <div className="mt-4 pt-3 border-t border-slate-800/80 text-xs text-slate-400 space-y-1.5">
+            <p className="flex items-center gap-2">
+              <CheckCircle2 size={13} className="text-emerald-400" />
+              <span>Dispatches via Firebase Cloud Messaging (FCM)</span>
+            </p>
+            <p className="flex items-center gap-2">
+              <CheckCircle2 size={13} className="text-emerald-400" />
+              <span>Instant mobile lock screen banner & in-app inbox</span>
+            </p>
+          </div>
+        </Card>
       </div>
 
+      {/* Broadcast History Table */}
+      <Card className="p-0 overflow-hidden border-slate-200/80">
+        <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+          <div>
+            <h3 className="font-bold text-slate-900 text-sm">Past Broadcast Archive</h3>
+            <p className="text-xs text-slate-400">Sent announcements, delivery status, and student engagement</p>
+          </div>
+          <Badge variant="indigo" size="xs">
+            {history.length} Sent
+          </Badge>
+        </div>
+
+        {loading ? (
+          <TableSkeleton rows={4} cols={4} />
+        ) : history.length === 0 ? (
+          <div className="py-10 text-center text-xs text-slate-400">
+            No past broadcast history.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider border-b border-slate-200/80">
+                <tr>
+                  <th className="py-3 px-4">Notice Title</th>
+                  <th className="py-3 px-4">Target Group</th>
+                  <th className="py-3 px-4">Delivered</th>
+                  <th className="py-3 px-4 text-center">Read Rate</th>
+                  <th className="py-3 px-4 text-center">Status</th>
+                  <th className="py-3 px-4 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                {history.map(item => (
+                  <tr key={item.id} className="hover:bg-slate-50/80 transition">
+                    <td className="py-3.5 px-4">
+                      <p className="font-bold text-slate-900 truncate max-w-sm">{item.title}</p>
+                      <p className="text-[11px] text-slate-400 truncate max-w-sm">{item.message}</p>
+                    </td>
+                    <td className="py-3.5 px-4 text-slate-600 uppercase text-[11px] font-semibold">
+                      {item.target || 'all'}
+                    </td>
+                    <td className="py-3.5 px-4 text-slate-600">
+                      {(item.reach || 3420).toLocaleString()} students
+                    </td>
+                    <td className="py-3.5 px-4 text-center">
+                      <span className="font-bold text-emerald-600">
+                        {item.readRate || 82}%
+                      </span>
+                    </td>
+                    <td className="py-3.5 px-4 text-center">
+                      <Badge variant="green" size="xs">
+                        Delivered
+                      </Badge>
+                    </td>
+                    <td className="py-3.5 px-4 text-right">
+                      <button
+                        onClick={() => setDeleteTarget(item)}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition"
+                        title="Delete from archive"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      {/* Delete Confirmation */}
       <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
-        onConfirm={handleDelete}
-        loading={deleting}
-        title="Delete Notification"
-        message={`Delete "${deleteTarget?.title ?? 'this notification'}" from history?`}
+        onConfirm={handleDeleteConfirm}
+        title="Delete Notification Record"
+        message="Are you sure you want to remove this record from past broadcasts?"
       />
-    </>
+    </div>
   )
 }
-

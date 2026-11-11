@@ -1,232 +1,363 @@
-// src/pages/ImpQuestionsPage.jsx
-import { useState, useRef } from 'react'
-import { Plus, Star, Upload, Trash2, Edit2, HelpCircle } from 'lucide-react'
-import Papa from 'papaparse'
-import toast from 'react-hot-toast'
-import { useImpQuestions } from '../hooks/useFirestore'
+// src/pages/ImpQuestionsPage.jsx — Important Questions PDF Repository (Exact Firestore Schema)
+import { useState, useMemo, useRef } from 'react'
 import {
-  PageHeader, Card, Button, Badge, Modal, ConfirmDialog,
-  Input, Textarea, Select, Toggle, TableSkeleton, EmptyState
+  Plus, FileText, Trash2, ExternalLink,
+  HardDrive, Search, Edit2, BookOpen, Calendar, HelpCircle
+} from 'lucide-react'
+import { addDoc, collection, doc, setDoc, serverTimestamp } from 'firebase/firestore'
+import toast from 'react-hot-toast'
+import { db } from '../lib/firebase'
+import { formatFirestoreDate } from '../lib/date'
+import { useImpQuestions, useCourses, useUpload } from '../hooks/useFirestore'
+import {
+  PageHeader, Card, Button, Badge, SlideOver, ConfirmDialog,
+  Input, TableSkeleton, EmptyState
 } from '../components/ui/index'
+import PdfUploadField, { CourseSelectField } from '../components/ui/PdfUploadField'
 
-const DIFFICULTY_COLORS = { easy: 'green', medium: 'yellow', hard: 'red' }
-const TYPE_COLORS        = { MCQ: 'blue', Theory: 'purple', Numerical: 'orange' }
+export default function ImpQuestionsPage() {
+  const { docs: questions, loading, remove } = useImpQuestions({
+    orderByField: 'createdAt',
+    orderDir: 'desc',
+  })
+  const { docs: courses } = useCourses()
+  const { upload, progress, uploading } = useUpload()
+  const fileInputRef = useRef(null)
 
-function QuestionForm({ q, onClose, onSave }) {
-  const [type, setType]         = useState(q?.type ?? 'MCQ')
-  const [difficulty, setDiff]   = useState(q?.difficulty ?? 'medium')
-  const [mustPractice, setMP]   = useState(q?.mustPractice ?? false)
-  const [options, setOptions]   = useState(q?.options ?? ['', '', '', ''])
-  const [correct, setCorrect]   = useState(q?.correctIndex ?? 0)
-  const [subject, setSubject]   = useState(q?.subject ?? '')
-  const [topic, setTopic]       = useState(q?.topic ?? '')
-  const [question, setQuestion] = useState(q?.question ?? '')
-  const [answer, setAnswer]     = useState(q?.answer ?? '')
-  const [saving, setSaving]     = useState(false)
+  const [courseFilter, setCourseFilter] = useState('All')
+  const [search, setSearch] = useState('')
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [editingQuestion, setEditingQuestion] = useState(null)
+  const [deleteTarget, setDeleteTarget] = useState(null)
 
-  async function handleSave() {
-    if (!question.trim()) return toast.error('Question is required')
+  // Form states matching exact Firestore schema:
+  // chapterNumber, courseId, createdAt, pdfUrl, title, year
+  const [title, setTitle] = useState('')
+  const [courseId, setCourseId] = useState('')
+  const [chapterNumber, setChapterNumber] = useState('1')
+  const [year, setYear] = useState(String(new Date().getFullYear()))
+  const [pdfUrl, setPdfUrl] = useState('')
+  const [pdfFile, setPdfFile] = useState(null)
+  const [saving, setSaving] = useState(false)
+
+  const courseNameMap = useMemo(() => {
+    const map = {}
+    courses.forEach(c => {
+      map[c.id] = c.title || c.id
+    })
+    return map
+  }, [courses])
+
+  const filtered = useMemo(() => {
+    return questions.filter(item => {
+      if (courseFilter !== 'All' && item.courseId !== courseFilter) return false
+      if (search.trim()) {
+        const q = search.toLowerCase()
+        const tMatch = (item.title || item.question || '').toLowerCase().includes(q)
+        const cMatch = (courseNameMap[item.courseId] || item.courseId || '').toLowerCase().includes(q)
+        const chMatch = String(item.chapterNumber ?? '').includes(q)
+        const yMatch = String(item.year ?? '').includes(q)
+        if (!tMatch && !cMatch && !chMatch && !yMatch) return false
+      }
+      return true
+    })
+  }, [questions, courseFilter, search, courseNameMap])
+
+  const uniqueCoursesCount = useMemo(
+    () => new Set(questions.map(q => q.courseId).filter(Boolean)).size,
+    [questions]
+  )
+  const latestYear = useMemo(() => {
+    if (questions.length === 0) return new Date().getFullYear()
+    return Math.max(...questions.map(q => Number(q.year) || 0)) || new Date().getFullYear()
+  }, [questions])
+
+  function openCreateDrawer() {
+    setEditingQuestion(null)
+    setTitle('')
+    setCourseId(courses[0]?.id || '')
+    setChapterNumber('1')
+    setYear(String(new Date().getFullYear()))
+    setPdfUrl('')
+    setPdfFile(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    setDrawerOpen(true)
+  }
+
+  function openEditDrawer(item) {
+    setEditingQuestion(item)
+    setTitle(item.title || item.question || '')
+    setCourseId(item.courseId || courses[0]?.id || '')
+    setChapterNumber(String(item.chapterNumber ?? 1))
+    setYear(String(item.year ?? new Date().getFullYear()))
+    setPdfUrl(item.pdfUrl || '')
+    setPdfFile(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    setDrawerOpen(true)
+  }
+
+  function handleFileSelect(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setPdfFile(file)
+    if (!title.trim()) {
+      setTitle(file.name.replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' '))
+    }
+  }
+
+  async function handleSave(addAnother = false) {
+    if (!title.trim()) return toast.error('Please enter a title')
+    if (!courseId.trim()) return toast.error('Please select or enter a courseId')
+
+    const parsedChapter = Number(chapterNumber)
+    const parsedYear = Number(year)
+    if (!Number.isFinite(parsedChapter) || parsedChapter < 0) {
+      return toast.error('Please enter a valid chapter number')
+    }
+    if (!Number.isFinite(parsedYear) || parsedYear < 2000) {
+      return toast.error('Please enter a valid year')
+    }
+    if (!pdfFile && !pdfUrl.trim()) {
+      return toast.error('Please upload a PDF or provide a PDF URL')
+    }
+
     setSaving(true)
     try {
-      await onSave({
-        subject, topic, type, difficulty, mustPractice, question, answer,
-        ...(type === 'MCQ' ? { options, correctIndex: correct } : {}),
-      })
-      onClose()
+      let finalPdfUrl = pdfUrl.trim()
+
+      if (pdfFile) {
+        finalPdfUrl = await upload(
+          pdfFile,
+          `impQuestions/${courseId.trim()}/ch_${parsedChapter}_${Date.now()}_${pdfFile.name}`
+        )
+      }
+
+      // Exact Firestore document fields only — no extra fields added
+      const payload = {
+        chapterNumber: parsedChapter,
+        courseId: courseId.trim(),
+        createdAt: editingQuestion?.createdAt || serverTimestamp(),
+        pdfUrl: finalPdfUrl,
+        title: title.trim(),
+        year: parsedYear,
+      }
+
+      if (editingQuestion) {
+        // setDoc without merge removes any legacy extra fields on this document
+        await setDoc(doc(db, 'impQuestions', editingQuestion.id), payload)
+        toast.success('Important question PDF updated in Firebase!')
+        setDrawerOpen(false)
+      } else {
+        await addDoc(collection(db, 'impQuestions'), payload)
+        if (addAnother) {
+          toast.success('Saved! Ready for next chapter PDF.')
+          setTitle('')
+          setChapterNumber(String(parsedChapter + 1))
+          setPdfUrl('')
+          setPdfFile(null)
+          if (fileInputRef.current) fileInputRef.current.value = ''
+        } else {
+          toast.success('PDF uploaded to Cloudinary & saved to Firebase!')
+          setDrawerOpen(false)
+        }
+      }
+    } catch (err) {
+      toast.error('Failed to save important question: ' + err.message)
     } finally {
       setSaving(false)
     }
   }
 
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        <Input label="Subject" value={subject} onChange={e => setSubject(e.target.value)} placeholder="Mathematics" />
-        <Input label="Topic" value={topic} onChange={e => setTopic(e.target.value)} placeholder="Calculus" />
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <Select label="Type" value={type} onChange={e => setType(e.target.value)}
-          options={['MCQ','Theory','Numerical'].map(v => ({ value: v, label: v }))} />
-        <Select label="Difficulty" value={difficulty} onChange={e => setDiff(e.target.value)}
-          options={['easy','medium','hard'].map(v => ({ value: v, label: v }))} />
-      </div>
-      <Textarea label="Question *" value={question} onChange={e => setQuestion(e.target.value)} rows={3} />
-      {type === 'MCQ' && (
-        <div>
-          <label className="text-sm font-medium text-gray-700 block mb-2">Options</label>
-          <div className="space-y-2">
-            {options.map((opt, i) => (
-              <div key={i} className="flex items-center gap-2">
-                <input
-                  type="radio"
-                  checked={correct === i}
-                  onChange={() => setCorrect(i)}
-                  className="accent-blue-600"
-                />
-                <input
-                  value={opt}
-                  onChange={e => setOptions(opts => opts.map((o, j) => j === i ? e.target.value : o))}
-                  placeholder={`Option ${i+1}`}
-                  className="flex-1 px-3 py-1.5 text-sm rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <Textarea label="Answer / Explanation" value={answer} onChange={e => setAnswer(e.target.value)} rows={3} />
-      <Toggle checked={mustPractice} onChange={setMP} label="Mark as Must Practice ★" />
-      <div className="flex justify-end gap-3">
-        <Button variant="secondary" onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSave} loading={saving}>{q ? 'Update' : 'Add Question'}</Button>
-      </div>
-    </div>
-  )
-}
-
-export default function ImpQuestionsPage() {
-  const { docs: questions, loading, add, update, remove } = useImpQuestions()
-  const [formOpen, setFormOpen]   = useState(false)
-  const [editQ, setEditQ]         = useState(null)
-  const [deleteTarget, setDelete] = useState(null)
-  const [subjectFilter, setSubF]  = useState('')
-  const [typeFilter, setTypeF]    = useState('All')
-  const [diffFilter, setDiffF]    = useState('All')
-  const csvRef = useRef()
-
-  const filtered = questions.filter(q => {
-    if (subjectFilter && !q.subject?.toLowerCase().includes(subjectFilter.toLowerCase())) return false
-    if (typeFilter !== 'All' && q.type !== typeFilter) return false
-    if (diffFilter !== 'All' && q.difficulty !== diffFilter) return false
-    return true
-  })
-
-  function downloadCSVTemplate() {
-    const csv = 'subject,topic,type,difficulty,question,answer,option1,option2,option3,option4,correctIndex,mustPractice\n'
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = 'questions_template.csv'
-    a.click()
-  }
-
-  async function handleCSVImport(e) {
-    const file = e.target.files[0]
-    if (!file) return
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async ({ data }) => {
-        let count = 0
-        for (const row of data) {
-          await add({
-            subject: row.subject, topic: row.topic, type: row.type,
-            difficulty: row.difficulty, question: row.question, answer: row.answer,
-            mustPractice: row.mustPractice === 'true',
-            ...(row.type === 'MCQ' ? {
-              options: [row.option1, row.option2, row.option3, row.option4],
-              correctIndex: Number(row.correctIndex ?? 0),
-            } : {}),
-          })
-          count++
-        }
-        toast.success(`Imported ${count} questions!`)
-      },
-      error: e => toast.error('CSV parse error: ' + e.message),
-    })
-    e.target.value = ''
-  }
-
-  async function handleSave(data) {
-    if (editQ) {
-      await update(editQ.id, data)
-      toast.success('Question updated!')
-    } else {
-      await add(data)
-      toast.success('Question added!')
-    }
+  async function handleDelete() {
+    if (!deleteTarget) return
+    await remove(deleteTarget.id)
+    setDeleteTarget(null)
   }
 
   return (
-    <>
+    <div className="space-y-6">
       <PageHeader
-        title="IMP Questions"
+        title="Important Questions"
+        description="Upload chapter-wise important question PDFs to Cloudinary and save exact schema records to Firebase"
         count={questions.length}
         action={
-          <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" onClick={downloadCSVTemplate}>
-              <Upload size={14} /> CSV Template
-            </Button>
-            <Button variant="secondary" onClick={() => csvRef.current?.click()}>
-              <Upload size={14} /> Import CSV
-            </Button>
-            <input ref={csvRef} type="file" accept=".csv" className="hidden" onChange={handleCSVImport} />
-            <Button onClick={() => { setEditQ(null); setFormOpen(true) }}>
-              <Plus size={15} /> Add Question
-            </Button>
-          </div>
+          <Button variant="primary" icon={Plus} onClick={openCreateDrawer}>
+            Upload Question PDF
+          </Button>
         }
       />
 
-      {/* Filter Bar */}
-      <div className="flex gap-3 mb-5 flex-wrap">
-        <input
-          value={subjectFilter}
-          onChange={e => setSubF(e.target.value)}
-          placeholder="Filter by subject…"
-          className="px-3 py-2 rounded-lg border border-gray-200 text-sm w-full sm:w-44 focus:outline-none focus:ring-2 focus:ring-blue-500"
-        />
-        <select value={typeFilter} onChange={e => setTypeF(e.target.value)}
-          className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 sm:flex-none">
-          {['All','MCQ','Theory','Numerical'].map(v => <option key={v}>{v}</option>)}
-        </select>
-        <select value={diffFilter} onChange={e => setDiffF(e.target.value)}
-          className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 sm:flex-none">
-          {['All','easy','medium','hard'].map(v => <option key={v}>{v}</option>)}
+      {/* KPI Stats Ribbon */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Total Question PDFs</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{questions.length}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-rose-50 text-rose-600 border border-rose-200/60">
+            <FileText size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Courses Covered</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{uniqueCoursesCount}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-200/60">
+            <BookOpen size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Latest Year</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{latestYear}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-emerald-50 text-emerald-600 border border-emerald-200/60">
+            <Calendar size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">PDF Storage</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">Cloudinary</p>
+          </div>
+          <div className="p-2 rounded-lg bg-blue-50 text-blue-600 border border-blue-200/60">
+            <HardDrive size={18} />
+          </div>
+        </div>
+      </div>
+
+      {/* Filter & Search Bar */}
+      <div className="bg-white rounded-xl border border-slate-200/80 p-3 shadow-xs flex flex-col sm:flex-row sm:items-center gap-3">
+        <div className="relative flex-1">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by title, course, chapter number, or year..."
+            className="w-full pl-9 pr-4 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-accent-500/20"
+          />
+        </div>
+
+        <select
+          value={courseFilter}
+          onChange={e => setCourseFilter(e.target.value)}
+          className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-accent-500/20"
+        >
+          <option value="All">All Courses</option>
+          {courses.map(c => (
+            <option key={c.id} value={c.id}>{c.title}</option>
+          ))}
         </select>
       </div>
 
-      <Card className="overflow-hidden p-0">
+      {/* Table Card */}
+      <Card className="p-0 overflow-hidden border-slate-200/80">
         {loading ? (
-          <div className="p-5"><TableSkeleton rows={6} cols={6} /></div>
+          <TableSkeleton rows={5} cols={6} />
         ) : filtered.length === 0 ? (
-          <EmptyState icon={HelpCircle} title="No questions found" />
+          <div className="py-12">
+            <EmptyState
+              icon={HelpCircle}
+              title="No important question PDFs found"
+              description="Upload a chapter-wise important questions PDF to Cloudinary and save it in Firebase."
+              action={
+                <Button variant="primary" icon={Plus} onClick={openCreateDrawer}>
+                  Upload Question PDF
+                </Button>
+              }
+            />
+          </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-100">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 border-b border-slate-200/80 text-slate-500 font-semibold uppercase tracking-wider">
                 <tr>
-                  {[
-                    { label: '#',          cls: '' },
-                    { label: 'Question',   cls: '' },
-                    { label: 'Subject',    cls: 'hidden sm:table-cell' },
-                    { label: 'Type',       cls: 'hidden sm:table-cell' },
-                    { label: 'Difficulty', cls: 'hidden md:table-cell' },
-                    { label: '★',          cls: 'hidden sm:table-cell' },
-                    { label: 'Actions',    cls: '' },
-                  ].map(h => (
-                    <th key={h.label} className={`px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide ${h.cls}`}>{h.label}</th>
-                  ))}
+                  <th className="py-3 px-4">Title</th>
+                  <th className="py-3 px-4">Course</th>
+                  <th className="py-3 px-4 text-center">Chapter</th>
+                  <th className="py-3 px-4 text-center">Year</th>
+                  <th className="py-3 px-4">Created At</th>
+                  <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody>
-                {filtered.map((q, i) => (
-                  <tr key={q.id} className="border-b border-gray-50 hover:bg-gray-50 transition">
-                    <td className="py-3 px-4 text-sm text-gray-400">{i+1}</td>
-                    <td className="py-3 px-4 text-sm text-gray-900 max-w-xs truncate">{q.question}</td>
-                    <td className="py-3 px-4 text-sm text-gray-500 hidden sm:table-cell">{q.subject ?? '—'}</td>
-                    <td className="py-3 px-4 hidden sm:table-cell"><Badge variant={TYPE_COLORS[q.type] ?? 'gray'}>{q.type ?? '—'}</Badge></td>
-                    <td className="py-3 px-4 hidden md:table-cell"><Badge variant={DIFFICULTY_COLORS[q.difficulty] ?? 'gray'}>{q.difficulty ?? '—'}</Badge></td>
-                    <td className="py-3 px-4 hidden sm:table-cell">
-                      {q.mustPractice && <Star size={14} className="text-yellow-400 fill-yellow-400" />}
+              <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                {filtered.map(item => (
+                  <tr key={item.id} className="hover:bg-slate-50/80 transition">
+                    <td className="py-3.5 px-4 max-w-sm">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg border flex-shrink-0 bg-rose-50 border-rose-200">
+                          <FileText size={16} className="text-rose-500" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-bold text-slate-900 line-clamp-1">
+                            {item.title || item.question || 'Untitled'}
+                          </p>
+                          {item.pdfUrl && (
+                            <p className="text-[10px] font-mono text-slate-400 truncate max-w-[240px]">
+                              {item.pdfUrl}
+                            </p>
+                          )}
+                        </div>
+                      </div>
                     </td>
-                    <td className="py-3 px-4">
-                      <div className="flex gap-2">
-                        <button onClick={() => { setEditQ(q); setFormOpen(true) }} className="p-1.5 text-gray-400 hover:text-blue-600 rounded">
-                          <Edit2 size={13} />
+
+                    <td className="py-3.5 px-4">
+                      <div className="flex items-center gap-1.5">
+                        <BookOpen size={13} className="text-indigo-500 flex-shrink-0" />
+                        <span className="font-semibold text-slate-800 line-clamp-1">
+                          {courseNameMap[item.courseId] || item.courseId || '—'}
+                        </span>
+                      </div>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-center">
+                      <Badge variant="indigo" size="xs">
+                        Ch. {item.chapterNumber ?? '—'}
+                      </Badge>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-center font-mono text-slate-600">
+                      {item.year ?? '—'}
+                    </td>
+
+                    <td className="py-3.5 px-4 text-[11px] text-slate-500 whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1">
+                        <Calendar size={11} className="text-slate-400" />
+                        {formatFirestoreDate(item.createdAt)}
+                      </span>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        {item.pdfUrl && (
+                          <a
+                            href={item.pdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="p-1.5 text-slate-400 hover:text-accent-600 hover:bg-slate-100 rounded-lg transition"
+                            title="Open PDF"
+                          >
+                            <ExternalLink size={14} />
+                          </a>
+                        )}
+                        <button
+                          onClick={() => openEditDrawer(item)}
+                          className="p-1.5 text-slate-400 hover:text-accent-600 hover:bg-slate-100 rounded-lg transition"
+                          title="Edit"
+                        >
+                          <Edit2 size={14} />
                         </button>
-                        <button onClick={() => setDelete(q)} className="p-1.5 text-gray-400 hover:text-red-500 rounded">
-                          <Trash2 size={13} />
+                        <button
+                          onClick={() => setDeleteTarget(item)}
+                          className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
+                          title="Delete"
+                        >
+                          <Trash2 size={14} />
                         </button>
                       </div>
                     </td>
@@ -238,17 +369,136 @@ export default function ImpQuestionsPage() {
         )}
       </Card>
 
-      <Modal open={formOpen} onClose={() => setFormOpen(false)} title={editQ ? 'Edit Question' : 'Add Question'} size="lg">
-        <QuestionForm q={editQ} onClose={() => setFormOpen(false)} onSave={handleSave} />
-      </Modal>
+      {/* SlideOver Drawer for Uploading / Editing Important Question PDFs */}
+      <SlideOver
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        title={editingQuestion ? 'Edit Important Question PDF' : 'Upload Important Question PDF'}
+        subtitle="Saves PDF in Cloudinary and stores exact document schema in Firebase."
+        width="sm:max-w-xl"
+      >
+        <div
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault()
+              handleSave(false)
+            }
+          }}
+          className="space-y-6"
+        >
+          {/* Section 1: Chapter & Course Details */}
+          <div className="space-y-3.5">
+            <div className="flex items-center gap-2 pb-1.5 border-b border-slate-100">
+              <span className="w-5 h-5 rounded-full bg-accent-100 text-accent-700 text-xs font-bold flex items-center justify-center">
+                1
+              </span>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                Chapter &amp; Course Details
+              </h3>
+            </div>
 
+            <Input
+              label="Title *"
+              placeholder="e.g. परमाणु की संरचना"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+            />
+
+            <CourseSelectField
+              courseId={courseId}
+              onChange={setCourseId}
+              courses={courses}
+            />
+
+            <div className="grid grid-cols-2 gap-3">
+              <Input
+                label="Chapter Number *"
+                type="number"
+                min={0}
+                value={chapterNumber}
+                onChange={e => setChapterNumber(e.target.value)}
+              />
+
+              <Input
+                label="Year *"
+                type="number"
+                min={2000}
+                max={2100}
+                value={year}
+                onChange={e => setYear(e.target.value)}
+              />
+            </div>
+          </div>
+
+          {/* Section 2: PDF Upload */}
+          <div className="space-y-3.5 pt-2">
+            <div className="flex items-center gap-2 pb-1.5 border-b border-slate-100">
+              <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">
+                2
+              </span>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                Upload PDF to Cloudinary
+              </h3>
+            </div>
+
+            <PdfUploadField
+              inputId="imp-question-pdf-upload"
+              fileInputRef={fileInputRef}
+              selectedFile={pdfFile}
+              onFileSelect={handleFileSelect}
+              uploading={uploading}
+              progress={progress}
+              pdfUrl={pdfUrl}
+              onPdfUrlChange={setPdfUrl}
+              selectLabel="Click to select Question PDF for Cloudinary"
+            />
+          </div>
+
+          {/* Sticky Bottom Actions Bar */}
+          <div className="flex items-center justify-between pt-4 border-t border-slate-200 bg-white sticky bottom-0 -mb-6 -mx-6 px-6 py-4 shadow-lg">
+            <span className="text-[11px] text-slate-400 hidden sm:flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-200 rounded font-mono text-[10px]">
+                Ctrl + Enter
+              </kbd>
+              to save immediately
+            </span>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+              <Button variant="secondary" onClick={() => setDrawerOpen(false)}>
+                Cancel
+              </Button>
+
+              {!editingQuestion && (
+                <Button
+                  variant="secondary"
+                  loading={saving || uploading}
+                  onClick={() => handleSave(true)}
+                  className="text-accent-700 hover:text-accent-800 border-accent-200 hover:bg-accent-50"
+                >
+                  Save &amp; Add Another
+                </Button>
+              )}
+
+              <Button
+                variant="primary"
+                loading={saving || uploading}
+                onClick={() => handleSave(false)}
+              >
+                {editingQuestion ? 'Save Changes' : 'Upload & Publish'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </SlideOver>
+
+      {/* Delete Confirmation */}
       <ConfirmDialog
         open={!!deleteTarget}
-        onClose={() => setDelete(null)}
-        onConfirm={async () => { await remove(deleteTarget.id); toast.success('Deleted'); setDelete(null) }}
-        title="Delete Question"
-        message="Delete this question permanently?"
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={handleDelete}
+        title="Delete Important Question"
+        message={`Are you sure you want to delete "${deleteTarget?.title || 'this item'}"?`}
       />
-    </>
+    </div>
   )
 }

@@ -1,185 +1,477 @@
-// src/pages/SyllabusPage.jsx
-import { useState, useCallback } from 'react'
-import { Plus, ChevronDown, ChevronRight, GripVertical, Save, Upload } from 'lucide-react'
-import toast from 'react-hot-toast'
-import { useCourses } from '../hooks/useFirestore'
-import { db } from '../lib/firebase'
-import { doc, setDoc, getDoc, serverTimestamp } from 'firebase/firestore'
+// src/pages/SyllabusPage.jsx — Course Syllabus PDF Repository (Exact Firestore Schema)
+import { useState, useMemo, useRef } from 'react'
 import {
-  PageHeader, Card, Button, Select, Input, Textarea,
-  Modal, SlideOver, FileUpload
+  Plus, FileText, Trash2, ExternalLink,
+  HardDrive, Search, Edit2, BookOpen, Calendar
+} from 'lucide-react'
+import { addDoc, collection, doc, setDoc, serverTimestamp } from 'firebase/firestore'
+import toast from 'react-hot-toast'
+import { db } from '../lib/firebase'
+import { formatFirestoreDate } from '../lib/date'
+import { useSyllabus, useCourses, useUpload } from '../hooks/useFirestore'
+import {
+  PageHeader, Card, Button, Badge, SlideOver, ConfirmDialog,
+  Input, TableSkeleton, EmptyState
 } from '../components/ui/index'
-import { useUpload } from '../hooks/useFirestore'
-import { storagePaths } from '../lib/storage'
-
-function ChapterAccordion({ chapter, index, onAddTopic, onUpdateTitle }) {
-  const [open, setOpen]   = useState(false)
-  const [title, setTitle] = useState(chapter.title ?? '')
-
-  return (
-    <div className="border border-gray-200 rounded-xl overflow-hidden">
-      <div
-        className="flex items-center gap-3 px-4 py-3 bg-gray-50 cursor-pointer hover:bg-gray-100 transition"
-        onClick={() => setOpen(o => !o)}
-      >
-        <GripVertical size={14} className="text-gray-300 flex-shrink-0" />
-        {open ? <ChevronDown size={16} className="text-gray-500 flex-shrink-0" /> : <ChevronRight size={16} className="text-gray-500 flex-shrink-0" />}
-        <input
-          value={title}
-          onChange={e => { e.stopPropagation(); setTitle(e.target.value); onUpdateTitle(index, e.target.value) }}
-          onClick={e => e.stopPropagation()}
-          className="flex-1 bg-transparent text-sm font-semibold text-gray-900 focus:outline-none"
-          placeholder="Chapter title"
-        />
-        <span className="text-xs text-gray-400">{chapter.topics?.length ?? 0} topics</span>
-      </div>
-      {open && (
-        <div className="px-4 py-3 space-y-2">
-          {(chapter.topics ?? []).map((topic, ti) => (
-            <div key={ti} className="flex items-start gap-2 bg-white border border-gray-100 rounded-lg px-3 py-2">
-              <GripVertical size={13} className="text-gray-300 mt-0.5 flex-shrink-0" />
-              <div>
-                <p className="text-sm font-medium text-gray-900">{topic.title}</p>
-                {topic.description && <p className="text-xs text-gray-400 mt-0.5">{topic.description}</p>}
-              </div>
-            </div>
-          ))}
-          <Button size="sm" variant="ghost" onClick={() => onAddTopic(index)} className="text-blue-600">
-            <Plus size={12} /> Add Topic
-          </Button>
-        </div>
-      )}
-    </div>
-  )
-}
+import PdfUploadField, { CourseSelectField } from '../components/ui/PdfUploadField'
 
 export default function SyllabusPage() {
+  const { docs: syllabi, loading, remove } = useSyllabus({
+    orderByField: 'createdAt',
+    orderDir: 'desc',
+  })
   const { docs: courses } = useCourses()
   const { upload, progress, uploading } = useUpload()
-  const [selectedCourse, setSC] = useState('')
-  const [chapters, setChapters] = useState([])
-  const [loaded, setLoaded]     = useState(false)
-  const [saving, setSaving]     = useState(false)
-  const [topicModal, setTM]     = useState(null)   // { chapterIndex }
-  const [newTopicTitle, setNTT] = useState('')
-  const [newTopicDesc, setNTD]  = useState('')
+  const fileInputRef = useRef(null)
 
-  async function loadSyllabus(courseId) {
-    setSC(courseId)
-    setLoaded(false)
-    if (!courseId) return
-    try {
-      const snap = await getDoc(doc(db, 'syllabus', courseId))
-      setChapters(snap.exists() ? (snap.data().chapters ?? []) : [])
-    } catch { setChapters([]) }
-    setLoaded(true)
+  const [courseFilter, setCourseFilter] = useState('All')
+  const [search, setSearch] = useState('')
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [editingSyllabus, setEditingSyllabus] = useState(null)
+  const [deleteTarget, setDeleteTarget] = useState(null)
+
+  // Form states matching exact Firestore schema:
+  // courseId, createdAt, pdfUrl, title, year
+  const [title, setTitle] = useState('')
+  const [courseId, setCourseId] = useState('')
+  const [year, setYear] = useState(String(new Date().getFullYear()))
+  const [pdfUrl, setPdfUrl] = useState('')
+  const [pdfFile, setPdfFile] = useState(null)
+  const [saving, setSaving] = useState(false)
+
+  const courseNameMap = useMemo(() => {
+    const map = {}
+    courses.forEach(c => {
+      map[c.id] = c.title || c.id
+    })
+    return map
+  }, [courses])
+
+  const filtered = useMemo(() => {
+    return syllabi.filter(item => {
+      if (courseFilter !== 'All' && item.courseId !== courseFilter) return false
+      if (search.trim()) {
+        const q = search.toLowerCase()
+        const tMatch = item.title?.toLowerCase().includes(q)
+        const cMatch = (courseNameMap[item.courseId] || item.courseId || '').toLowerCase().includes(q)
+        const yMatch = String(item.year ?? '').includes(q)
+        if (!tMatch && !cMatch && !yMatch) return false
+      }
+      return true
+    })
+  }, [syllabi, courseFilter, search, courseNameMap])
+
+  const uniqueCoursesCount = useMemo(
+    () => new Set(syllabi.map(s => s.courseId).filter(Boolean)).size,
+    [syllabi]
+  )
+  const latestYear = useMemo(() => {
+    if (syllabi.length === 0) return new Date().getFullYear()
+    return Math.max(...syllabi.map(s => Number(s.year) || 0)) || new Date().getFullYear()
+  }, [syllabi])
+
+  function openCreateDrawer() {
+    setEditingSyllabus(null)
+    setTitle('')
+    setCourseId(courses[0]?.id || '')
+    setYear(String(new Date().getFullYear()))
+    setPdfUrl('')
+    setPdfFile(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    setDrawerOpen(true)
   }
 
-  function updateChapterTitle(idx, title) {
-    setChapters(cs => cs.map((c, i) => i === idx ? { ...c, title } : c))
+  function openEditDrawer(item) {
+    setEditingSyllabus(item)
+    setTitle(item.title || '')
+    setCourseId(item.courseId || courses[0]?.id || '')
+    setYear(String(item.year ?? new Date().getFullYear()))
+    setPdfUrl(item.pdfUrl || '')
+    setPdfFile(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    setDrawerOpen(true)
   }
 
-  function addChapter() {
-    setChapters(cs => [...cs, { title: `Chapter ${cs.length + 1}`, topics: [] }])
+  function handleFileSelect(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setPdfFile(file)
+    if (!title.trim()) {
+      setTitle(file.name.replace(/\.[^/.]+$/, '').replace(/[_-]/g, ' '))
+    }
   }
 
-  async function addTopic(chapterIndex) {
-    if (!newTopicTitle.trim()) return toast.error('Topic title required')
-    setChapters(cs => cs.map((c, i) => i === chapterIndex
-      ? { ...c, topics: [...(c.topics ?? []), { title: newTopicTitle, description: newTopicDesc }] }
-      : c
-    ))
-    setTM(null); setNTT(''); setNTD('')
-  }
+  async function handleSave(addAnother = false) {
+    if (!title.trim()) return toast.error('Please enter a syllabus title')
+    if (!courseId.trim()) return toast.error('Please select or enter a courseId')
 
-  async function saveSyllabus() {
-    if (!selectedCourse) return toast.error('Select a course first')
+    const parsedYear = Number(year)
+    if (!Number.isFinite(parsedYear) || parsedYear < 2000) {
+      return toast.error('Please enter a valid year')
+    }
+    if (!pdfFile && !pdfUrl.trim()) {
+      return toast.error('Please upload a syllabus PDF or provide a PDF URL')
+    }
+
     setSaving(true)
     try {
-      await setDoc(doc(db, 'syllabus', selectedCourse), {
-        chapters,
-        updatedAt: serverTimestamp(),
-      }, { merge: true })
-      toast.success('Syllabus saved!')
+      let finalPdfUrl = pdfUrl.trim()
+
+      if (pdfFile) {
+        finalPdfUrl = await upload(
+          pdfFile,
+          `syllabus/${courseId.trim()}/${Date.now()}_${pdfFile.name}`
+        )
+      }
+
+      // Exact Firestore document fields only — no extra fields added
+      const payload = {
+        courseId: courseId.trim(),
+        createdAt: editingSyllabus?.createdAt || serverTimestamp(),
+        pdfUrl: finalPdfUrl,
+        title: title.trim(),
+        year: parsedYear,
+      }
+
+      if (editingSyllabus) {
+        // setDoc without merge removes any legacy extra fields (e.g. chapters, updatedAt)
+        await setDoc(doc(db, 'syllabus', editingSyllabus.id), payload)
+        toast.success('Syllabus updated in Firebase database!')
+        setDrawerOpen(false)
+      } else {
+        await addDoc(collection(db, 'syllabus'), payload)
+        if (addAnother) {
+          toast.success('Syllabus saved! Ready for next PDF.')
+          setTitle('')
+          setPdfUrl('')
+          setPdfFile(null)
+          if (fileInputRef.current) fileInputRef.current.value = ''
+        } else {
+          toast.success('Syllabus PDF uploaded to Cloudinary & saved to Firebase!')
+          setDrawerOpen(false)
+        }
+      }
+    } catch (err) {
+      toast.error('Failed to save syllabus: ' + err.message)
     } finally {
       setSaving(false)
     }
   }
 
-  async function handlePdfUpload(file) {
-    if (!selectedCourse) return toast.error('Select a course first')
-    const url = await upload(file, storagePaths.syllabusPdf(selectedCourse))
-    await setDoc(doc(db, 'syllabus', selectedCourse), { pdfUrl: url }, { merge: true })
-    toast.success('PDF uploaded!')
+  async function handleDelete() {
+    if (!deleteTarget) return
+    await remove(deleteTarget.id)
+    setDeleteTarget(null)
   }
 
   return (
-    <>
-      <PageHeader title="Syllabus Builder" />
+    <div className="space-y-6">
+      <PageHeader
+        title="Course Syllabus"
+        description="Upload syllabus PDFs to Cloudinary and save exact schema records to Firebase"
+        count={syllabi.length}
+        action={
+          <Button variant="primary" icon={Plus} onClick={openCreateDrawer}>
+            Upload Syllabus
+          </Button>
+        }
+      />
 
-      <Card className="mb-5">
-        <div className="flex items-center gap-4 flex-wrap">
-          <div className="flex-1 min-w-[200px]">
-            <Select
-              label="Select Course"
-              options={[
-                { value: '', label: 'Choose a course…' },
-                ...courses.map(c => ({ value: c.id, label: c.title })),
-              ]}
-              value={selectedCourse}
-              onChange={e => loadSyllabus(e.target.value)}
+      {/* KPI Stats Ribbon */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Total Syllabi</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{syllabi.length}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-rose-50 text-rose-600 border border-rose-200/60">
+            <FileText size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Courses Covered</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{uniqueCoursesCount}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-200/60">
+            <BookOpen size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">Latest Year</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">{latestYear}</p>
+          </div>
+          <div className="p-2 rounded-lg bg-emerald-50 text-emerald-600 border border-emerald-200/60">
+            <Calendar size={18} />
+          </div>
+        </div>
+
+        <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs flex items-center justify-between">
+          <div>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase">PDF Storage</p>
+            <p className="text-xl font-extrabold text-slate-900 mt-0.5">Cloudinary</p>
+          </div>
+          <div className="p-2 rounded-lg bg-blue-50 text-blue-600 border border-blue-200/60">
+            <HardDrive size={18} />
+          </div>
+        </div>
+      </div>
+
+      {/* Filter & Search Bar */}
+      <div className="bg-white rounded-xl border border-slate-200/80 p-3 shadow-xs flex flex-col sm:flex-row sm:items-center gap-3">
+        <div className="relative flex-1">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by syllabus title, course, or year..."
+            className="w-full pl-9 pr-4 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-accent-500/20"
+          />
+        </div>
+
+        <select
+          value={courseFilter}
+          onChange={e => setCourseFilter(e.target.value)}
+          className="px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-accent-500/20"
+        >
+          <option value="All">All Courses</option>
+          {courses.map(c => (
+            <option key={c.id} value={c.id}>{c.title}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Table Card */}
+      <Card className="p-0 overflow-hidden border-slate-200/80">
+        {loading ? (
+          <TableSkeleton rows={4} cols={5} />
+        ) : filtered.length === 0 ? (
+          <div className="py-12">
+            <EmptyState
+              icon={BookOpen}
+              title="No syllabus PDFs found"
+              description="Upload a course syllabus PDF to Cloudinary and store its URL in Firebase."
+              action={
+                <Button variant="primary" icon={Plus} onClick={openCreateDrawer}>
+                  Upload Syllabus
+                </Button>
+              }
             />
           </div>
-          {selectedCourse && (
-            <div className="flex gap-2 pt-5">
-              <Button size="sm" variant="secondary" onClick={addChapter}>
-                <Plus size={13} /> Add Chapter
-              </Button>
-              <FileUpload
-                label=""
-                accept=".pdf"
-                onFile={handlePdfUpload}
-                progress={uploading ? progress : undefined}
-              />
-              <Button size="sm" onClick={saveSyllabus} loading={saving}>
-                <Save size={13} /> Save
-              </Button>
-            </div>
-          )}
-        </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 border-b border-slate-200/80 text-slate-500 font-semibold uppercase tracking-wider">
+                <tr>
+                  <th className="py-3 px-4">Title</th>
+                  <th className="py-3 px-4">Course</th>
+                  <th className="py-3 px-4 text-center">Year</th>
+                  <th className="py-3 px-4">Created At</th>
+                  <th className="py-3 px-4 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                {filtered.map(item => (
+                  <tr key={item.id} className="hover:bg-slate-50/80 transition">
+                    <td className="py-3.5 px-4 max-w-sm">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg border flex-shrink-0 bg-rose-50 border-rose-200">
+                          <FileText size={16} className="text-rose-500" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-bold text-slate-900 line-clamp-1">{item.title || 'Untitled Syllabus'}</p>
+                          {item.pdfUrl && (
+                            <p className="text-[10px] font-mono text-slate-400 truncate max-w-[240px]">
+                              {item.pdfUrl}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+
+                    <td className="py-3.5 px-4">
+                      <div className="flex items-center gap-1.5">
+                        <BookOpen size={13} className="text-indigo-500 flex-shrink-0" />
+                        <span className="font-semibold text-slate-800 line-clamp-1">
+                          {courseNameMap[item.courseId] || item.courseId || '—'}
+                        </span>
+                      </div>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-center">
+                      <Badge variant="indigo" size="xs">
+                        {item.year ?? '—'}
+                      </Badge>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-[11px] text-slate-500 whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1">
+                        <Calendar size={11} className="text-slate-400" />
+                        {formatFirestoreDate(item.createdAt)}
+                      </span>
+                    </td>
+
+                    <td className="py-3.5 px-4 text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        {item.pdfUrl && (
+                          <a
+                            href={item.pdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="p-1.5 text-slate-400 hover:text-accent-600 hover:bg-slate-100 rounded-lg transition"
+                            title="Open Syllabus PDF"
+                          >
+                            <ExternalLink size={14} />
+                          </a>
+                        )}
+                        <button
+                          onClick={() => openEditDrawer(item)}
+                          className="p-1.5 text-slate-400 hover:text-accent-600 hover:bg-slate-100 rounded-lg transition"
+                          title="Edit Syllabus"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                        <button
+                          onClick={() => setDeleteTarget(item)}
+                          className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
+                          title="Delete Syllabus"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Card>
 
-      {loaded && (
-        <div className="space-y-3">
-          {chapters.length === 0 ? (
-            <Card>
-              <p className="text-sm text-gray-400 text-center py-8">No chapters yet. Add your first chapter.</p>
-            </Card>
-          ) : (
-            chapters.map((ch, i) => (
-              <ChapterAccordion
-                key={i}
-                index={i}
-                chapter={ch}
-                onAddTopic={idx => setTM({ chapterIndex: idx })}
-                onUpdateTitle={updateChapterTitle}
-              />
-            ))
-          )}
-        </div>
-      )}
+      {/* SlideOver Drawer for Uploading / Editing Syllabus */}
+      <SlideOver
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        title={editingSyllabus ? 'Edit Syllabus' : 'Upload Syllabus PDF'}
+        subtitle="Saves PDF in Cloudinary and stores exact document schema in Firebase."
+        width="sm:max-w-xl"
+      >
+        <div
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault()
+              handleSave(false)
+            }
+          }}
+          className="space-y-6"
+        >
+          {/* Section 1: Syllabus Details */}
+          <div className="space-y-3.5">
+            <div className="flex items-center gap-2 pb-1.5 border-b border-slate-100">
+              <span className="w-5 h-5 rounded-full bg-accent-100 text-accent-700 text-xs font-bold flex items-center justify-center">
+                1
+              </span>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                Syllabus Details
+              </h3>
+            </div>
 
-      {/* Add Topic Modal */}
-      <Modal open={!!topicModal} onClose={() => setTM(null)} title="Add Topic" size="md">
-        <div className="space-y-4">
-          <Input label="Topic Title *" value={newTopicTitle} onChange={e => setNTT(e.target.value)} />
-          <Textarea label="Description" value={newTopicDesc} onChange={e => setNTD(e.target.value)} rows={3} />
-          <div className="flex justify-end gap-3">
-            <Button variant="secondary" onClick={() => setTM(null)}>Cancel</Button>
-            <Button onClick={() => addTopic(topicModal?.chapterIndex)}>Add Topic</Button>
+            <Input
+              label="Title *"
+              placeholder="e.g. JAC Board Syllabus"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+            />
+
+            <CourseSelectField
+              courseId={courseId}
+              onChange={setCourseId}
+              courses={courses}
+            />
+
+            <Input
+              label="Year *"
+              type="number"
+              min={2000}
+              max={2100}
+              value={year}
+              onChange={e => setYear(e.target.value)}
+            />
+          </div>
+
+          {/* Section 2: PDF Upload */}
+          <div className="space-y-3.5 pt-2">
+            <div className="flex items-center gap-2 pb-1.5 border-b border-slate-100">
+              <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">
+                2
+              </span>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                Upload PDF to Cloudinary
+              </h3>
+            </div>
+
+            <PdfUploadField
+              inputId="syllabus-pdf-upload"
+              fileInputRef={fileInputRef}
+              selectedFile={pdfFile}
+              onFileSelect={handleFileSelect}
+              uploading={uploading}
+              progress={progress}
+              pdfUrl={pdfUrl}
+              onPdfUrlChange={setPdfUrl}
+              selectLabel="Click to select Syllabus PDF for Cloudinary"
+            />
+          </div>
+
+          {/* Sticky Bottom Actions Bar */}
+          <div className="flex items-center justify-between pt-4 border-t border-slate-200 bg-white sticky bottom-0 -mb-6 -mx-6 px-6 py-4 shadow-lg">
+            <span className="text-[11px] text-slate-400 hidden sm:flex items-center gap-1">
+              <kbd className="px-1.5 py-0.5 bg-slate-100 border border-slate-200 rounded font-mono text-[10px]">
+                Ctrl + Enter
+              </kbd>
+              to save immediately
+            </span>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+              <Button variant="secondary" onClick={() => setDrawerOpen(false)}>
+                Cancel
+              </Button>
+
+              {!editingSyllabus && (
+                <Button
+                  variant="secondary"
+                  loading={saving || uploading}
+                  onClick={() => handleSave(true)}
+                  className="text-accent-700 hover:text-accent-800 border-accent-200 hover:bg-accent-50"
+                >
+                  Save &amp; Add Another
+                </Button>
+              )}
+
+              <Button
+                variant="primary"
+                loading={saving || uploading}
+                onClick={() => handleSave(false)}
+              >
+                {editingSyllabus ? 'Save Changes' : 'Upload & Publish'}
+              </Button>
+            </div>
           </div>
         </div>
-      </Modal>
-    </>
+      </SlideOver>
+
+      {/* Delete Confirmation */}
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={handleDelete}
+        title="Delete Syllabus"
+        message={`Are you sure you want to delete "${deleteTarget?.title || 'this syllabus'}"?`}
+      />
+    </div>
   )
 }

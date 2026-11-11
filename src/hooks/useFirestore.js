@@ -1,27 +1,26 @@
-// src/hooks/useFirestore.js — Generic real-time Firestore hook factory
-
+// src/hooks/useFirestore.js — Pure Real-time Firestore hooks (Direct Database Reflection)
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   collection, query, orderBy, limit, startAfter,
   onSnapshot, doc, addDoc, updateDoc, deleteDoc,
-  setDoc, serverTimestamp, getCountFromServer,
-  where,
+  setDoc, serverTimestamp, where
 } from 'firebase/firestore'
 import { db } from '../lib/firebase'
 import toast from 'react-hot-toast'
+import { uploadFile } from '../lib/storage'
 
 /**
- * Generic real-time collection hook with pagination + CRUD.
+ * Generic real-time collection hook with pagination + CRUD reflecting pure Firestore data.
  *
- * @param {string}   collectionName
- * @param {object}   options  { orderByField, orderDir, pageSize, where: [[field, op, value]] }
+ * @param {string} collectionName - Name of the Firestore collection
+ * @param {object} options - Query configuration
  */
 export function useCollection(collectionName, options = {}) {
   const {
     orderByField = 'createdAt',
     orderDir     = 'desc',
-    pageSize     = 25,
-    filters      = [],   // [{ field, op, value }]
+    pageSize     = 50,
+    filters      = [],
   } = options
 
   const [docs,    setDocs]    = useState([])
@@ -29,13 +28,10 @@ export function useCollection(collectionName, options = {}) {
   const [error,   setError]   = useState(null)
   const [hasMore, setHasMore] = useState(false)
 
-  const lastDocRef   = useRef(null)
-  const unsubRef     = useRef(null)
-
-  // Serialize filters to avoid re-subscribing when an inline array/object reference is passed
+  const lastDocRef = useRef(null)
+  const unsubRef   = useRef(null)
   const filtersKey = JSON.stringify(filters)
 
-  // Build base query constraints
   const buildConstraints = useCallback((cursor = null, includeOrderBy = true) => {
     const constraints = []
     const parsedFilters = JSON.parse(filtersKey || '[]')
@@ -48,16 +44,17 @@ export function useCollection(collectionName, options = {}) {
       constraints.push(orderBy(orderByField, orderDir))
     }
     if (cursor) constraints.push(startAfter(cursor))
-    constraints.push(limit(pageSize + 1))   // fetch 1 extra to detect hasMore
+    constraints.push(limit(pageSize + 1))
     return constraints
   }, [filtersKey, orderByField, orderDir, pageSize])
 
-  // Initial subscription
   useEffect(() => {
+    let active = true
     setLoading(true)
     setError(null)
 
     const handleSnapshot = snapshot => {
+      if (!active) return
       const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
       if (items.length > pageSize) {
         items.pop()
@@ -70,36 +67,59 @@ export function useCollection(collectionName, options = {}) {
       setLoading(false)
     }
 
-    const q = query(collection(db, collectionName), ...buildConstraints(null, true))
+    try {
+      const q = query(collection(db, collectionName), ...buildConstraints(null, true))
 
-    unsubRef.current?.()
-    unsubRef.current = onSnapshot(
-      q,
-      handleSnapshot,
-      err => {
-        if (orderByField) {
-          // Fallback to unordered query if composite/single-field index is missing
-          const fallbackQ = query(collection(db, collectionName), ...buildConstraints(null, false))
-          unsubRef.current = onSnapshot(
-            fallbackQ,
-            handleSnapshot,
-            fallbackErr => {
-              setError(fallbackErr.message)
-              setLoading(false)
+      unsubRef.current?.()
+      unsubRef.current = onSnapshot(
+        q,
+        handleSnapshot,
+        err => {
+          // If query failed due to ordering/index requirements, try unordered query
+          if (orderByField) {
+            try {
+              const fallbackQ = query(collection(db, collectionName), ...buildConstraints(null, false))
+              unsubRef.current = onSnapshot(
+                fallbackQ,
+                handleSnapshot,
+                fallbackErr => {
+                  console.error(`[Firestore ${collectionName} error]:`, fallbackErr)
+                  if (active) {
+                    setError(fallbackErr.message)
+                    setDocs([])
+                    setLoading(false)
+                  }
+                }
+              )
+              return
+            } catch (e) {
+              // Ignore
             }
-          )
-        } else {
-          setError(err.message)
-          setLoading(false)
+          }
+          console.error(`[Firestore ${collectionName} error]:`, err)
+          if (active) {
+            setError(err.message)
+            setDocs([])
+            setLoading(false)
+          }
         }
+      )
+    } catch (err) {
+      console.error(`[Firestore ${collectionName} init error]:`, err)
+      if (active) {
+        setError(err.message)
+        setDocs([])
+        setLoading(false)
       }
-    )
+    }
 
-    return () => unsubRef.current?.()
+    return () => {
+      active = false
+      unsubRef.current?.()
+    }
   }, [collectionName, buildConstraints, orderByField, pageSize])
 
-  // ── CRUD helpers ──────────────────────────────────────────────────────────
-
+  // ── Real Firestore CRUD helpers ───────────────────────────────────────────
   const add = useCallback(async (data) => {
     try {
       const ref = await addDoc(collection(db, collectionName), {
@@ -107,9 +127,10 @@ export function useCollection(collectionName, options = {}) {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       })
+      toast.success('Document added to database!')
       return ref.id
     } catch (e) {
-      toast.error(`Failed to create: ${e.message}`)
+      toast.error(`Database write failed: ${e.message}`)
       throw e
     }
   }, [collectionName])
@@ -120,8 +141,9 @@ export function useCollection(collectionName, options = {}) {
         ...data,
         updatedAt: serverTimestamp(),
       })
+      toast.success('Updated in database!')
     } catch (e) {
-      toast.error(`Failed to update: ${e.message}`)
+      toast.error(`Database update failed: ${e.message}`)
       throw e
     }
   }, [collectionName])
@@ -129,8 +151,9 @@ export function useCollection(collectionName, options = {}) {
   const remove = useCallback(async (id) => {
     try {
       await deleteDoc(doc(db, collectionName, id))
+      toast.success('Deleted from database!')
     } catch (e) {
-      toast.error(`Failed to delete: ${e.message}`)
+      toast.error(`Database delete failed: ${e.message}`)
       throw e
     }
   }, [collectionName])
@@ -141,8 +164,9 @@ export function useCollection(collectionName, options = {}) {
         ...data,
         updatedAt: serverTimestamp(),
       }, { merge: true })
+      toast.success('Saved to database!')
     } catch (e) {
-      toast.error(`Failed to save: ${e.message}`)
+      toast.error(`Database save failed: ${e.message}`)
       throw e
     }
   }, [collectionName])
@@ -150,24 +174,20 @@ export function useCollection(collectionName, options = {}) {
   return { docs, loading, error, hasMore, add, update, remove, upsert }
 }
 
-// ─── Specific collection hooks (thin wrappers) ────────────────────────────────
+// ── Specific Collection Hooks ───────────────────────────────────────────────
+export const useCourses        = (opts) => useCollection('courses',        opts)
+export const useLiveClasses    = (opts) => useCollection('liveClasses',    opts)
+export const useRecordedClasses= (opts) => useCollection('recordedClasses',opts)
+export const useStudyMaterials = (opts) => useCollection('studyMaterials', opts)
+export const useSyllabus       = (opts) => useCollection('syllabus',       opts)
+export const useImpQuestions   = (opts) => useCollection('impQuestions',   opts)
+export const usePrevYearPapers = (opts) => useCollection('prevYearPapers', opts)
+export const useUsers          = (opts) => useCollection('users',          opts)
+export const usePurchases      = (opts) => useCollection('purchases',      opts)
+export const useNotifications  = (opts) => useCollection('notifications',  opts)
+export const useFeedback       = (opts) => useCollection('feedback',       opts)
 
-export const useCourses       = (opts) => useCollection('courses',          opts)
-export const useLiveClasses   = (opts) => useCollection('liveClasses',      opts)
-export const useRecordedClasses=(opts) => useCollection('recordedClasses',  opts)
-export const useStudyMaterials= (opts) => useCollection('studyMaterials',   opts)
-export const useSyllabus      = (opts) => useCollection('syllabus',         opts)
-export const useImpQuestions  = (opts) => useCollection('impQuestions',     opts)
-export const usePrevYearPapers= (opts) => useCollection('prevYearPapers',   opts)
-export const useUsers         = (opts) => useCollection('users',            opts)
-export const usePurchases     = (opts) => useCollection('purchases',        opts)
-export const useNotifications = (opts) => useCollection('notifications',    opts)
-export const useFeedback      = (opts) => useCollection('feedback',         opts)
-
-// ─── useUpload — unified file upload hook ────────────────────────────────────
-
-import { uploadFile } from '../lib/storage'
-
+// ── File Upload Hook (Cloudinary for images & files, Firebase for videos) ─────
 export function useUpload() {
   const [progress, setProgress] = useState(0)
   const [uploading, setUploading] = useState(false)
